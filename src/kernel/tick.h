@@ -14,9 +14,7 @@
 #define __KERNEL_TICK_H__
 
 
-typedef unsigned char  uint8_t;
-typedef unsigned int   uint16_t;
-typedef unsigned long  uint32_t;
+#include "Data_rename.h"
 
 
 /**
