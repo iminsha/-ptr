@@ -4,4 +4,24 @@
  */
 
 #pragma once
+#ifndef __BSP_I2C_SOFT_H_
+#define __BSP_I2C_SOFT_H_
+
+#include <REG52.H>
+
+/* ===== I2C 引脚配置（按硬件修改）===== */
+#ifndef I2C_SCL
+sbit I2C_SCL = P2^1;
+#endif
+#ifndef I2C_SDA
+sbit I2C_SDA = P2^0;
+#endif
+void startI2cSet();
+void sendByteData(unsigned char Data);
+bit receiveBitACKData();
+unsigned char receiveByteData();
+void sendBitACKData(bit Data);
+void StopI2cSet();
+
+#endif
 
