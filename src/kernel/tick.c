@@ -9,7 +9,7 @@
 #include <REG52.H>
 
 /* 32-bit 毫秒计数：只能在 tick_isr_1ms() 中自增 */
-static volatile uint32_t s_tick_ms = 0;
+static volatile uint32_t idata s_tick_ms = 0;
 
 /* 进入/退出临界区：保护 32-bit 读取 */
 static uint8_t critical_enter(void)

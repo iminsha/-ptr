@@ -19,12 +19,12 @@ typedef struct {
     uint8_t  mode;     /* stmr_mode_t */
 } stmr_cb_t;
 
-static volatile stmr_cb_t s_tmr[STMR_MAX];
+static volatile stmr_cb_t idata s_tmr[STMR_MAX];
 
 /* 到期队列：仅保存到期 timer ID */
-static volatile uint8_t s_expq[STMR_EXPQ_CAP];
-static volatile uint8_t s_qh = 0, s_qt = 0, s_qc = 0;
-static volatile uint16_t s_drop = 0;
+static volatile uint8_t idata s_expq[STMR_EXPQ_CAP];
+static volatile uint8_t idata s_qh = 0, s_qt = 0, s_qc = 0;
+static volatile uint16_t idata s_drop = 0;
 
 /* 临界区（保护主循环与中断并发访问） */
 static uint8_t critical_enter(void)
@@ -182,4 +182,5 @@ void stmr_clear_drop_count(void)
     s_drop = 0;
     critical_exit(ea_prev);
 }
+
 
