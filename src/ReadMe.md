@@ -10,6 +10,7 @@
 - `docs/architecture/layers.md`：技术落地实现框架（分层）
 - `docs/architecture/code_structure.md`：代码目录建议
 - `docs/data/data_structures.md`：核心数据结构（契约）
+- `docs/protocol/protocol_v1.md`：通信协议 V1（CMD/SEQ/ACK/错误码）
 - `docs/timing/scheduling.md`：调度与时序设计
 - `docs/ui/ui_spec.md`：UI 交互规范
 - `docs/cli/cli_spec.md`：串口 CLI 规范

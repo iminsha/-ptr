@@ -1,31 +1,16 @@
-# ==========================================
-# 1. 基础逻辑：忽略 pc_ui 下除 src 以外的所有内容
-# ==========================================
-/*
-!/src/
-!/.gitignore
-!/README.md
-
-# 如果需要保留构建文件（如 CMakeLists.txt），取消下面行的注释
-# !/CMakeLists.txt
-
-# ==========================================
-# 2. 具体的忽略规则 (你提供的列表)
-# ==========================================
-
-# dot files (点文件/配置文件)
+# dot files
 /.vscode/launch.json
 /.settings
 /.eide/log
 /.eide.usr.ctx.json
 
-# project out (编译输出目录)
+# project out
 /build
 /bin
 /obj
 /out
 
-# eide template (EIDE 模板及插件相关)
+# eide template
 *.ept
 *.eide-template
 *.clang-format

@@ -37,8 +37,8 @@
 #define UART_TX_MASK               (UART_TX_BUFFER_SIZE - 1)
 #define UART_FRAME_QUEUE_MASK      (UART_FRAME_QUEUE_SIZE - 1)
 
-/* 帧固定开销 = SOF1 + SOF2 + LEN + CMD + CHECKSUM = 5 字节 */
-#define UART_FRAME_OVERHEAD        5
+/* 帧固定开销 = SOF1 + SOF2 + VER + CMD + SEQ + LEN + CHECKSUM = 7 字节 */
+#define UART_FRAME_OVERHEAD        7
 
 /* 11.0592MHz 晶振、Timer1 模式2、SMOD=0 时，4800bps 的重装值 */
 #define UART_TH1_RELOAD_4800       0xFA
@@ -77,8 +77,10 @@ typedef enum
 {
     UART_PARSE_WAIT_SOF1 = 0,     /* 等待第1个帧头字节 0x55 */
     UART_PARSE_WAIT_SOF2,         /* 等待第2个帧头字节 0xAA */
-    UART_PARSE_WAIT_LEN,          /* 等待长度 LEN */
+    UART_PARSE_WAIT_VER,          /* 等待协议版本 VER */
     UART_PARSE_WAIT_CMD,          /* 等待命令 CMD */
+    UART_PARSE_WAIT_SEQ,          /* 等待序号 SEQ */
+    UART_PARSE_WAIT_LEN,          /* 等待长度 LEN */
     UART_PARSE_WAIT_PAYLOAD,      /* 接收 payload */
     UART_PARSE_WAIT_CHECKSUM      /* 等待校验字节 */
 } uart_parse_state_t;
@@ -163,7 +165,9 @@ static void uart_reset_parser(void)
     s_parse_state = UART_PARSE_WAIT_SOF1;
     s_parse_index = 0;
     s_parse_sum = 0;
+    s_parse_frame.ver = 0;
     s_parse_frame.cmd = 0;
+    s_parse_frame.seq = 0;
     s_parse_frame.len = 0;
     s_parse_frame.checksum = 0;
 }
@@ -193,9 +197,9 @@ static void uart_queue_frame(const UartFrame *frame)
 /*
  * 喂入 1 字节到协议状态机。
  * 帧格式:
- *   [SOF1][SOF2][LEN][CMD][PAYLOAD...][CHECKSUM]
+ *   [SOF1][SOF2][VER][CMD][SEQ][LEN][PAYLOAD...][CHECKSUM]
  * 校验:
- *   CHECKSUM = (LEN + CMD + 每个PAYLOAD字节) & 0xFF
+ *   CHECKSUM = (VER + CMD + SEQ + LEN + 每个PAYLOAD字节) & 0xFF
  */
 static void uart_parse_feed(unsigned char byte)
 {
@@ -211,7 +215,7 @@ static void uart_parse_feed(unsigned char byte)
     case UART_PARSE_WAIT_SOF2:
         if (byte == UART_FRAME_SOF2)
         {
-            s_parse_state = UART_PARSE_WAIT_LEN;
+            s_parse_state = UART_PARSE_WAIT_VER;
         }
         else if (byte == UART_FRAME_SOF1)
         {
@@ -227,12 +231,11 @@ static void uart_parse_feed(unsigned char byte)
         }
         break;
 
-    case UART_PARSE_WAIT_LEN:
-        if (byte <= UART_FRAME_MAX_PAYLOAD)
+    case UART_PARSE_WAIT_VER:
+        if (byte == UART_FRAME_VER)
         {
-            s_parse_frame.len = byte;
+            s_parse_frame.ver = byte;
             s_parse_sum = byte;
-            s_parse_index = 0;
             s_parse_state = UART_PARSE_WAIT_CMD;
         }
         else
@@ -244,13 +247,33 @@ static void uart_parse_feed(unsigned char byte)
     case UART_PARSE_WAIT_CMD:
         s_parse_frame.cmd = byte;
         s_parse_sum = (unsigned char)(s_parse_sum + byte);
-        if (s_parse_frame.len == 0)
+        s_parse_state = UART_PARSE_WAIT_SEQ;
+        break;
+
+    case UART_PARSE_WAIT_SEQ:
+        s_parse_frame.seq = byte;
+        s_parse_sum = (unsigned char)(s_parse_sum + byte);
+        s_parse_state = UART_PARSE_WAIT_LEN;
+        break;
+
+    case UART_PARSE_WAIT_LEN:
+        if (byte <= UART_FRAME_MAX_PAYLOAD)
         {
-            s_parse_state = UART_PARSE_WAIT_CHECKSUM;
+            s_parse_frame.len = byte;
+            s_parse_index = 0;
+            s_parse_sum = (unsigned char)(s_parse_sum + byte);
+            if (s_parse_frame.len == 0)
+            {
+                s_parse_state = UART_PARSE_WAIT_CHECKSUM;
+            }
+            else
+            {
+                s_parse_state = UART_PARSE_WAIT_PAYLOAD;
+            }
         }
         else
         {
-            s_parse_state = UART_PARSE_WAIT_PAYLOAD;
+            uart_reset_parser();
         }
         break;
 
@@ -538,6 +561,7 @@ unsigned char Uart_ProtocolGetFrame(UartFrame *frame)
  * - 0: 参数非法或空间不足
  */
 unsigned char Uart_ProtocolSendFrame(unsigned char cmd,
+                                     unsigned char seq,
                                      const unsigned char *payload,
                                      unsigned char len)
 {
@@ -556,8 +580,10 @@ unsigned char Uart_ProtocolSendFrame(unsigned char cmd,
         return 0;
     }
 
-    checksum = len;
+    checksum = UART_FRAME_VER;
     checksum = (unsigned char)(checksum + cmd);
+    checksum = (unsigned char)(checksum + seq);
+    checksum = (unsigned char)(checksum + len);
     for (i = 0; i < len; i++)
     {
         checksum = (unsigned char)(checksum + payload[i]);
@@ -575,8 +601,10 @@ unsigned char Uart_ProtocolSendFrame(unsigned char cmd,
 
     (void)uart_tx_push_locked(UART_FRAME_SOF1);
     (void)uart_tx_push_locked(UART_FRAME_SOF2);
-    (void)uart_tx_push_locked(len);
+    (void)uart_tx_push_locked(UART_FRAME_VER);
     (void)uart_tx_push_locked(cmd);
+    (void)uart_tx_push_locked(seq);
+    (void)uart_tx_push_locked(len);
     for (i = 0; i < len; i++)
     {
         (void)uart_tx_push_locked(payload[i]);
