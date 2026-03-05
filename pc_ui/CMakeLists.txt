@@ -21,6 +21,8 @@ add_executable(mySmartHostUI
     src/main.cpp
     src/mainwindow.h
     src/mainwindow.cpp
+    src/mainwindow_ui.cpp
+    src/mainwindow_link.cpp
 )
 
 # 3. 链接库文件

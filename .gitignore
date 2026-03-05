@@ -14,7 +14,6 @@
 *.ept
 *.eide-template
 *.clang-format
-/.eide
 *.code-workspace
 /.unify_builder
 /.vscode
