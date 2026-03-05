@@ -1,7 +1,7 @@
 #include "protocol_v1_service.h"
-#include "../drivers/lcd1602.h"
+#include "../bsp/bsp_uart.h"
 
-/* 命令定义（V1） */
+/* 协议命令定义（仅用于语义映射） */
 #define CMD_PING_REQ        0x01
 #define CMD_MODE_SET_REQ    0x02
 #define CMD_MOVE_TO_REQ     0x03
@@ -10,7 +10,6 @@
 #define CMD_CFG_GET_REQ     0x06
 #define CMD_CFG_SET_REQ     0x07
 #define CMD_STATUS_GET_REQ  0x08
-/* 响应/事件命令（用于兼容回环或链路反向数据） */
 #define CMD_PING_RSP        0x41
 #define CMD_STATUS_RSP      0x48
 #define CMD_CFG_RSP         0x49
@@ -19,323 +18,328 @@
 #define CMD_STATUS_EVT      0x80
 #define CMD_ERROR_EVT       0x81
 
-/* 参数规则 */
+/* 参数校验规则 */
 #define RULE_NONE           0
 #define RULE_MODE_0_2       1
 #define RULE_U8_0_100       2
 #define RULE_U8_1_5         3
-#define RULE_CFG_SET_V1     4
+#define RULE_FIXED_LEN_3    4
 
-/* 解码错误码 */
-#define DEC_OK              0
-#define DEC_ERR_VER         1
-#define DEC_ERR_CMD         2
-#define DEC_ERR_LEN         3
-#define DEC_ERR_PARAM       4
+/* 解码队列：仅保留1条，最大限度节省IDATA */
+#define PROTO_DEC_QUEUE_SIZE 1
+#define PROTO_DEC_QUEUE_MASK (PROTO_DEC_QUEUE_SIZE - 1)
+
+/* 解析状态机 */
+#define PS_WAIT_SOF1    0
+#define PS_WAIT_SOF2    1
+#define PS_WAIT_VER     2
+#define PS_WAIT_CMD     3
+#define PS_WAIT_SEQ     4
+#define PS_WAIT_LEN     5
+#define PS_WAIT_PAYLOAD 6
+#define PS_WAIT_CHK     7
 
 typedef struct
 {
     unsigned char cmd;
+    unsigned char name_id;
     unsigned char min_len;
     unsigned char max_len;
     unsigned char rule;
-} CmdDef;
+} CmdMapItem;
 
-typedef struct
+/* 命令映射表：仅用于解析层语义翻译 */
+static CmdMapItem code g_cmd_map[] =
 {
-    unsigned char ok;
-    unsigned char err;
-    unsigned char cmd;
-    unsigned char p0;
-    unsigned char p1;
-    unsigned char p2;
-} DecodeResult;
-
-/* 命令字典表：后续扩展命令仅需增加这里 */
-static const CmdDef code g_cmd_defs[] =
-{
-    { CMD_PING_REQ,       0, 0, RULE_NONE      },
-    { CMD_MODE_SET_REQ,   1, 1, RULE_MODE_0_2  },
-    { CMD_MOVE_TO_REQ,    1, 1, RULE_U8_0_100  },
-    { CMD_STOP_REQ,       0, 0, RULE_NONE      },
-    { CMD_BEEP_REQ,       1, 1, RULE_U8_1_5    },
-    { CMD_CFG_GET_REQ,    0, 0, RULE_NONE      },
-    { CMD_CFG_SET_REQ,    3, 3, RULE_CFG_SET_V1},
-    { CMD_STATUS_GET_REQ, 0, 0, RULE_NONE      },
-    { CMD_PING_RSP,       4, 4, RULE_NONE      },
-    { CMD_STATUS_RSP,     5, 5, RULE_NONE      },
-    { CMD_CFG_RSP,        0, 16, RULE_NONE     },
-    { CMD_ACK,            1, 1, RULE_NONE      },
-    { CMD_NACK,           1, 1, RULE_NONE      },
-    { CMD_STATUS_EVT,     5, 5, RULE_NONE      },
-    { CMD_ERROR_EVT,      2, 2, RULE_NONE      }
+    { CMD_PING_REQ,       PROTO_V1_NAME_PING_REQ, 0, 0, RULE_NONE },
+    { CMD_MODE_SET_REQ,   PROTO_V1_NAME_MODE_SET, 1, 1, RULE_MODE_0_2 },
+    { CMD_MOVE_TO_REQ,    PROTO_V1_NAME_MOVE_TO,  1, 1, RULE_U8_0_100 },
+    { CMD_STOP_REQ,       PROTO_V1_NAME_STOP_REQ, 0, 0, RULE_NONE },
+    { CMD_BEEP_REQ,       PROTO_V1_NAME_BEEP_REQ, 1, 1, RULE_U8_1_5 },
+    { CMD_CFG_GET_REQ,    PROTO_V1_NAME_CFG_GET,  0, 0, RULE_NONE },
+    { CMD_CFG_SET_REQ,    PROTO_V1_NAME_CFG_SET,  3, 3, RULE_FIXED_LEN_3 },
+    { CMD_STATUS_GET_REQ, PROTO_V1_NAME_STAT_GET, 0, 0, RULE_NONE },
+    { CMD_PING_RSP,       PROTO_V1_NAME_PING_RSP, 4, 4, RULE_NONE },
+    { CMD_STATUS_RSP,     PROTO_V1_NAME_STAT_RSP, 5, 5, RULE_NONE },
+    { CMD_CFG_RSP,        PROTO_V1_NAME_CFG_RSP,  0, 32, RULE_NONE },
+    { CMD_ACK,            PROTO_V1_NAME_ACK,      1, 1, RULE_NONE },
+    { CMD_NACK,           PROTO_V1_NAME_NACK,     1, 1, RULE_NONE },
+    { CMD_STATUS_EVT,     PROTO_V1_NAME_STAT_EVT, 5, 5, RULE_NONE },
+    { CMD_ERROR_EVT,      PROTO_V1_NAME_ERR_EVT,  2, 2, RULE_NONE }
 };
 
-/* 保存最近一帧，用于页面轮播 */
-static UartFrame xdata g_last_frame;
-static UartFrame xdata g_rx_frame;
-static DecodeResult xdata g_last_dec;
-static unsigned char idata g_has_frame = 0;
+/* 解析器运行时变量（全部用内部RAM，避免xdata问题） */
+static unsigned char idata g_ps = PS_WAIT_SOF1;
+static unsigned char idata g_cmd = 0;
+static unsigned char idata g_seq = 0;
+static unsigned char idata g_len = 0;
+static unsigned char idata g_idx = 0;
+static unsigned char idata g_sum = 0;
+static unsigned char idata g_p0 = 0;
+static unsigned char idata g_p1 = 0;
+static unsigned char idata g_p2 = 0;
 
-static char to_hex(unsigned char v)
+/* 解码结果队列 */
+static ProtoV1Decoded data g_dec_queue[PROTO_DEC_QUEUE_SIZE];
+static unsigned char data g_dec_head = 0;
+static unsigned char data g_dec_tail = 0;
+static ProtoV1Decoded data g_dec_work;
+
+/*
+ * 函数：reset_parser
+ * 作用：复位帧解析状态机。
+ */
+static void reset_parser(void)
 {
-    v &= 0x0F;
-    if (v < 10)
-    {
-        return (char)('0' + v);
-    }
-    return (char)('A' + (v - 10));
+    g_ps = PS_WAIT_SOF1;
+    g_cmd = 0;
+    g_seq = 0;
+    g_len = 0;
+    g_idx = 0;
+    g_sum = 0;
+    g_p0 = 0;
+    g_p1 = 0;
+    g_p2 = 0;
 }
 
-static void lcd_clear(void)
-{
-    unsigned char col;
-    for (col = 1; col <= 16; ++col)
-    {
-        LCD_ShowChar(1, col, ' ');
-        LCD_ShowChar(2, col, ' ');
-    }
-}
-
-static const CmdDef *find_cmd_def(unsigned char cmd)
+/*
+ * 函数：find_cmd_map_index
+ * 作用：查找命令映射表下标。
+ */
+static unsigned char find_cmd_map_index(unsigned char cmd, unsigned char *found)
 {
     unsigned char i;
     unsigned char cnt;
-    cnt = (unsigned char)(sizeof(g_cmd_defs) / sizeof(g_cmd_defs[0]));
+    cnt = (unsigned char)(sizeof(g_cmd_map) / sizeof(g_cmd_map[0]));
     for (i = 0; i < cnt; ++i)
     {
-        if (g_cmd_defs[i].cmd == cmd)
+        if (g_cmd_map[i].cmd == cmd)
         {
-            return &g_cmd_defs[i];
+            *found = 1;
+            return i;
         }
     }
+    *found = 0;
     return 0;
 }
 
-/* 按字典和规则进行解码，得到“命令语义” */
-static void decode_frame(const UartFrame *frame, DecodeResult *out)
+/*
+ * 函数：push_decoded
+ * 作用：解码结果入队。
+ * 返回：1成功，0队列满
+ */
+static unsigned char push_decoded(const ProtoV1Decoded *item)
 {
-    const CmdDef *def;
-
-    out->ok = 0;
-    out->err = DEC_OK;
-    out->cmd = frame->cmd;
-    out->p0 = 0;
-    out->p1 = 0;
-    out->p2 = 0;
-
-    /* 版本校验在串口协议层已完成，这里不再因版本字段拦截，避免内存抖动误报。 */
-
-    def = find_cmd_def(frame->cmd);
-    if (def == 0)
+    unsigned char next;
+    if (PROTO_DEC_QUEUE_SIZE == 1)
     {
-        out->err = DEC_ERR_CMD;
-        return;
+        /* 单槽队列：新结果覆盖旧结果 */
+        g_dec_queue[0] = *item;
+        g_dec_head = 1;
+        g_dec_tail = 0;
+        return 1;
     }
 
-    if (frame->len < def->min_len || frame->len > def->max_len)
+    next = (unsigned char)((g_dec_head + 1) & PROTO_DEC_QUEUE_MASK);
+    if (next == g_dec_tail)
     {
-        out->err = DEC_ERR_LEN;
-        return;
+        return 0;
     }
-
-    if (def->rule == RULE_NONE)
-    {
-        out->ok = 1;
-        return;
-    }
-
-    if (def->rule == RULE_MODE_0_2)
-    {
-        if (frame->payload[0] > 2)
-        {
-            out->err = DEC_ERR_PARAM;
-            return;
-        }
-        out->p0 = frame->payload[0];
-        out->ok = 1;
-        return;
-    }
-
-    if (def->rule == RULE_U8_0_100)
-    {
-        if (frame->payload[0] > 100)
-        {
-            out->err = DEC_ERR_PARAM;
-            return;
-        }
-        out->p0 = frame->payload[0];
-        out->ok = 1;
-        return;
-    }
-
-    if (def->rule == RULE_U8_1_5)
-    {
-        if (frame->payload[0] < 1 || frame->payload[0] > 5)
-        {
-            out->err = DEC_ERR_PARAM;
-            return;
-        }
-        out->p0 = frame->payload[0];
-        out->ok = 1;
-        return;
-    }
-
-    if (def->rule == RULE_CFG_SET_V1)
-    {
-        out->p0 = frame->payload[0];
-        out->p1 = frame->payload[1];
-        out->p2 = frame->payload[2];
-        out->ok = 1;
-        return;
-    }
-
-    out->err = DEC_ERR_PARAM;
+    g_dec_queue[g_dec_head] = *item;
+    g_dec_head = next;
+    return 1;
 }
 
-/* 显示语义页：第一行命令名，第二行参数或错误 */
-static void render_sem_page(const DecodeResult *dec)
+/*
+ * 函数：decode_current_frame
+ * 作用：把当前解析完成的帧字段翻译成语义结果。
+ */
+static void decode_current_frame(void)
 {
-    char cmd_hex[3];
+    unsigned char idx;
+    unsigned char found;
+    unsigned char rule;
 
-    cmd_hex[0] = to_hex((unsigned char)(dec->cmd >> 4));
-    cmd_hex[1] = to_hex(dec->cmd);
-    cmd_hex[2] = '\0';
+    g_dec_work.valid = 0;
+    g_dec_work.err = PROTO_V1_ERR_NONE;
+    g_dec_work.cmd = g_cmd;
+    g_dec_work.name_id = PROTO_V1_NAME_UNKNOWN;
+    g_dec_work.seq = g_seq;
+    g_dec_work.len = g_len;
+    g_dec_work.p0 = g_p0;
+    g_dec_work.p1 = g_p1;
+    g_dec_work.p2 = g_p2;
 
-    lcd_clear();
-
-    if (!dec->ok)
+    idx = find_cmd_map_index(g_cmd, &found);
+    if (!found)
     {
-        LCD_ShowString(1, 1, "DECODE ERROR");
-        if (dec->err == DEC_ERR_VER) LCD_ShowString(2, 1, "ERR:BAD_VER");
-        else if (dec->err == DEC_ERR_CMD) LCD_ShowString(2, 1, "ERR:BAD_CMD");
-        else if (dec->err == DEC_ERR_LEN) LCD_ShowString(2, 1, "ERR:BAD_LEN");
-        else if (dec->err == DEC_ERR_PARAM) LCD_ShowString(2, 1, "ERR:BAD_PARAM");
-        else LCD_ShowString(2, 1, "ERR:UNKNOWN");
-        return;
-    }
-
-    if (dec->cmd == CMD_PING_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:PING_REQ");
-        LCD_ShowString(2, 1, "NO PARAM");
-        return;
-    }
-    if (dec->cmd == CMD_MODE_SET_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:MODE_SET");
-        if (dec->p0 == 0) LCD_ShowString(2, 1, "MODE:AUTO");
-        else if (dec->p0 == 1) LCD_ShowString(2, 1, "MODE:MANUAL");
-        else LCD_ShowString(2, 1, "MODE:SAFE");
-        return;
-    }
-    if (dec->cmd == CMD_MOVE_TO_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:MOVE_TO");
-        LCD_ShowString(2, 1, "POS:000%");
-        LCD_ShowChar(2, 5, (char)('0' + (dec->p0 / 100)));
-        LCD_ShowChar(2, 6, (char)('0' + ((dec->p0 / 10) % 10)));
-        LCD_ShowChar(2, 7, (char)('0' + (dec->p0 % 10)));
-        return;
-    }
-    if (dec->cmd == CMD_STOP_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:STOP_REQ");
-        LCD_ShowString(2, 1, "NO PARAM");
-        return;
-    }
-    if (dec->cmd == CMD_BEEP_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:BEEP_REQ");
-        LCD_ShowString(2, 1, "COUNT:0");
-        LCD_ShowChar(2, 7, (char)('0' + dec->p0));
-        return;
-    }
-    if (dec->cmd == CMD_CFG_GET_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:CFG_GET");
-        LCD_ShowString(2, 1, "NO PARAM");
-        return;
-    }
-    if (dec->cmd == CMD_CFG_SET_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:CFG_SET");
-        LCD_ShowString(2, 1, "K/V RAW");
-        return;
-    }
-    if (dec->cmd == CMD_STATUS_GET_REQ)
-    {
-        LCD_ShowString(1, 1, "CMD:STAT_GET");
-        LCD_ShowString(2, 1, "NO PARAM");
-        return;
-    }
-    if (dec->cmd == CMD_PING_RSP)
-    {
-        LCD_ShowString(1, 1, "CMD:PING_RSP");
-        LCD_ShowString(2, 1, "RSP FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_STATUS_RSP)
-    {
-        LCD_ShowString(1, 1, "CMD:STAT_RSP");
-        LCD_ShowString(2, 1, "RSP FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_CFG_RSP)
-    {
-        LCD_ShowString(1, 1, "CMD:CFG_RSP");
-        LCD_ShowString(2, 1, "RSP FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_ACK)
-    {
-        LCD_ShowString(1, 1, "CMD:ACK");
-        LCD_ShowString(2, 1, "RSP FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_NACK)
-    {
-        LCD_ShowString(1, 1, "CMD:NACK");
-        LCD_ShowString(2, 1, "RSP FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_STATUS_EVT)
-    {
-        LCD_ShowString(1, 1, "CMD:STAT_EVT");
-        LCD_ShowString(2, 1, "EVENT FRAME");
-        return;
-    }
-    if (dec->cmd == CMD_ERROR_EVT)
-    {
-        LCD_ShowString(1, 1, "CMD:ERR_EVT");
-        LCD_ShowString(2, 1, "EVENT FRAME");
+        g_dec_work.err = PROTO_V1_ERR_CMD_UNKNOWN;
+        (void)push_decoded(&g_dec_work);
         return;
     }
 
-    LCD_ShowString(1, 1, "CMD:UNKNOWN");
-    LCD_ShowString(2, 1, "CMD=0x");
-    LCD_ShowString(2, 7, cmd_hex);
+    g_dec_work.name_id = g_cmd_map[idx].name_id;
+    if (g_len < g_cmd_map[idx].min_len || g_len > g_cmd_map[idx].max_len)
+    {
+        g_dec_work.err = PROTO_V1_ERR_LEN_INVALID;
+        (void)push_decoded(&g_dec_work);
+        return;
+    }
+
+    rule = g_cmd_map[idx].rule;
+    if (rule == RULE_MODE_0_2 && g_dec_work.p0 > 2)
+    {
+        g_dec_work.err = PROTO_V1_ERR_LEN_INVALID;
+        (void)push_decoded(&g_dec_work);
+        return;
+    }
+    if (rule == RULE_U8_0_100 && g_dec_work.p0 > 100)
+    {
+        g_dec_work.err = PROTO_V1_ERR_LEN_INVALID;
+        (void)push_decoded(&g_dec_work);
+        return;
+    }
+    if (rule == RULE_U8_1_5 && (g_dec_work.p0 < 1 || g_dec_work.p0 > 5))
+    {
+        g_dec_work.err = PROTO_V1_ERR_LEN_INVALID;
+        (void)push_decoded(&g_dec_work);
+        return;
+    }
+
+    g_dec_work.valid = 1;
+    (void)push_decoded(&g_dec_work);
+}
+
+/*
+ * 函数：feed_byte
+ * 作用：喂入1字节到协议帧状态机。
+ */
+static void feed_byte(unsigned char b)
+{
+    switch (g_ps)
+    {
+    case PS_WAIT_SOF1:
+        if (b == UART_FRAME_SOF1) g_ps = PS_WAIT_SOF2;
+        break;
+
+    case PS_WAIT_SOF2:
+        if (b == UART_FRAME_SOF2) g_ps = PS_WAIT_VER;
+        else if (b != UART_FRAME_SOF1) reset_parser();
+        break;
+
+    case PS_WAIT_VER:
+        if (b == UART_FRAME_VER)
+        {
+            g_sum = b;
+            g_ps = PS_WAIT_CMD;
+        }
+        else
+        {
+            reset_parser();
+        }
+        break;
+
+    case PS_WAIT_CMD:
+        g_cmd = b;
+        g_sum = (unsigned char)(g_sum + b);
+        g_ps = PS_WAIT_SEQ;
+        break;
+
+    case PS_WAIT_SEQ:
+        g_seq = b;
+        g_sum = (unsigned char)(g_sum + b);
+        g_ps = PS_WAIT_LEN;
+        break;
+
+    case PS_WAIT_LEN:
+        if (b <= 32)
+        {
+            g_len = b;
+            g_sum = (unsigned char)(g_sum + b);
+            g_idx = 0;
+            g_ps = (g_len == 0) ? PS_WAIT_CHK : PS_WAIT_PAYLOAD;
+        }
+        else
+        {
+            reset_parser();
+        }
+        break;
+
+    case PS_WAIT_PAYLOAD:
+        if (g_idx < 32)
+        {
+            if (g_idx == 0) g_p0 = b;
+            else if (g_idx == 1) g_p1 = b;
+            else if (g_idx == 2) g_p2 = b;
+            g_idx++;
+            g_sum = (unsigned char)(g_sum + b);
+            if (g_idx >= g_len)
+            {
+                g_ps = PS_WAIT_CHK;
+            }
+        }
+        else
+        {
+            reset_parser();
+        }
+        break;
+
+    case PS_WAIT_CHK:
+        if (g_sum == b)
+        {
+            decode_current_frame();
+        }
+        reset_parser();
+        break;
+
+    default:
+        reset_parser();
+        break;
+    }
 }
 
 void ProtoV1_Init(void)
 {
-    g_has_frame = 0;
-    lcd_clear();
+    g_dec_head = 0;
+    g_dec_tail = 0;
+    reset_parser();
 }
 
 void ProtoV1_Poll(void)
 {
-    Uart_ProtocolProcess();
-    while (Uart_ProtocolGetFrame(&g_rx_frame))
+    unsigned char b;
+    while (Uart_ReadByte(&b))
     {
-        g_last_frame = g_rx_frame;
-        decode_frame(&g_last_frame, &g_last_dec);
-        g_has_frame = 1;
-        render_sem_page(&g_last_dec);
+        feed_byte(b);
     }
+}
+
+unsigned char ProtoV1_GetDecoded(ProtoV1Decoded *out)
+{
+    if (out == 0)
+    {
+        return 0;
+    }
+    if (PROTO_DEC_QUEUE_SIZE == 1)
+    {
+        if (g_dec_head == 0)
+        {
+            return 0;
+        }
+        *out = g_dec_queue[0];
+        g_dec_head = 0;
+        return 1;
+    }
+    if (g_dec_head == g_dec_tail)
+    {
+        return 0;
+    }
+    *out = g_dec_queue[g_dec_tail];
+    g_dec_tail = (unsigned char)((g_dec_tail + 1) & PROTO_DEC_QUEUE_MASK);
+    return 1;
 }
 
 void ProtoV1_Tick10ms(void)
 {
-    /* 当前版本仅显示语义，不做页面轮播 */
+    /* 解析层当前无周期任务 */
 }

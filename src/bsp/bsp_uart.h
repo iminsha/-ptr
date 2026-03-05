@@ -9,8 +9,8 @@
  * - Optional protocol parser/packer for unified V1 frame.
  */
 
-#define UART_RX_BUFFER_SIZE        64
-#define UART_TX_BUFFER_SIZE        64
+#define UART_RX_BUFFER_SIZE        32
+#define UART_TX_BUFFER_SIZE        32
 #define UART_BAUD_RATE             4800
 
 /* V1 frame: [55][AA][VER][CMD][SEQ][LEN][PAYLOAD...][CHK] */

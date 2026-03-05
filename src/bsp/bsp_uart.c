@@ -54,8 +54,9 @@
  * - 大对象（RX/TX 缓冲、协议帧）统一放到 xdata。
  * - 小状态变量放到 idata，尽量减少 DATA 段压力。
  */
-static volatile unsigned char xdata s_rx_buf[UART_RX_BUFFER_SIZE];
-static volatile unsigned char xdata s_tx_buf[UART_TX_BUFFER_SIZE];
+/* 关键路径缓存放在内部RAM，避免无XRAM硬件上读到0xFF */
+static volatile unsigned char idata s_rx_buf[UART_RX_BUFFER_SIZE];
+static volatile unsigned char idata s_tx_buf[UART_TX_BUFFER_SIZE];
 
 /* head: 写入位置；tail: 读取位置 */
 static volatile unsigned char idata s_rx_head;
@@ -655,8 +656,9 @@ void Uart_ISR(void) interrupt 4
         unsigned char idata rx_data;
         unsigned char idata next;
 
-        RI = 0;
+        /* 8051推荐顺序：先读SBUF，再清RI，避免极端时序下读错字节 */
         rx_data = SBUF;
+        RI = 0;
 
         next = (unsigned char)((s_rx_head + 1) & UART_RX_MASK);
         if (next == s_rx_tail)
