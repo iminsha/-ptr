@@ -48,6 +48,8 @@ ds18b20_err_t DS18B20_ReadTempX10(int16_t* out_x10)
     uint8_t i;
     uint8_t j;
     uint8_t crc = 0;
+    uint8_t all_zero = 1u;
+    uint8_t all_ff = 1u;
     /* raw：DS18B20 原始 1/16°C 补码；x10：换算后的 0.1°C。 */
     int16_t raw;
     int16_t x10;
@@ -68,6 +70,25 @@ ds18b20_err_t DS18B20_ReadTempX10(int16_t* out_x10)
     for (i = 0; i < 9; i++)
     {
         scratchpad[i] = ow_read_byte();
+        if (scratchpad[i] != 0x00u)
+        {
+            all_zero = 0u;
+        }
+        if (scratchpad[i] != 0xFFu)
+        {
+            all_ff = 0u;
+        }
+    }
+
+    /*
+     * 总线异常保护：
+     * - 全 0x00 常见于数据线被拉低/无效读取；
+     * - 全 0xFF 常见于数据线悬空/上拉读取。
+     * 这两种情况如果直接参与CRC可能“误通过”，会表现为假温度（如 0.0C）。
+     */
+    if ((all_zero != 0u) || (all_ff != 0u))
+    {
+        return DS18B20_ERR_NO_DEVICE;
     }
 
     /* 依据 Dallas CRC8 多项式 0x31(反转表示 0x8C) 计算校验。 */

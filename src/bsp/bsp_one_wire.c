@@ -1,6 +1,17 @@
 #include "bsp_one_wire.h"
 #include <intrins.h>
 
+static unsigned char ow_enter_critical(void)
+{
+    unsigned char ea_old = EA;
+    EA = 0;
+    return ea_old;
+}
+
+static void ow_exit_critical(unsigned char ea_old)
+{
+    EA = ea_old;
+}
 /* 以下延时常数基于 11.0592MHz 标定，用于满足 1-Wire 时序窗口。 */
 static void ow_delay_480us(void)
 {
@@ -55,8 +66,8 @@ static void ow_delay_15us(void)
 
 uint8_t ow_reset_presence(void)
 {
-    /* presence=1 表示检测到从机应答脉冲（总线被拉低）。 */
     uint8_t presence;
+    unsigned char ea_old = ow_enter_critical();
 
     ONEWIRE_DQ = 1;
     _nop_();
@@ -70,6 +81,7 @@ uint8_t ow_reset_presence(void)
     presence = (ONEWIRE_DQ == 0) ? 1u : 0u;
     ow_delay_240us();
 
+    ow_exit_critical(ea_old);
     return presence;
 }
 
@@ -95,19 +107,20 @@ void ow_write_bit(uint8_t b)
 
 uint8_t ow_read_bit(void)
 {
-    /* b 保存本次读时隙采样结果。 */
     uint8_t b;
+    unsigned char ea_old = ow_enter_critical();
 
-    /* 读时隙起始：短拉低后释放，由从机驱动。 */
     ONEWIRE_DQ = 0;
     ow_delay_15us();
 
     ONEWIRE_DQ = 1;
-    ow_delay_15us();
+    _nop_();          /* 释放后稍等一点 */
+    _nop_();
 
     b = (ONEWIRE_DQ != 0) ? 1u : 0u;
-    ow_delay_30us();
+    ow_delay_60us();
 
+    ow_exit_critical(ea_old);
     return b;
 }
 

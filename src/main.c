@@ -2,15 +2,12 @@
 #include "drivers/lcd1602.h"
 #include "services/protocol_v1_service.h"
 #include "services/action_center.h"
-
+#include "drivers/ds18b20.h"
+#include "bsp/bsp_uart.h"
 static ProtoV1Decoded xdata g_dec;
-
 /*
  * 函数：DelayMS
  * 作用：粗略毫秒延时（基于11.0592MHz经验值）
- * 参数：
- * - ms: 延时毫秒数
- * 返回：无
  */
 static void DelayMS(unsigned int ms)
 {
@@ -24,149 +21,55 @@ static void DelayMS(unsigned int ms)
     }
 }
 
-/*
- * 函数：HexNibble
- * 作用：将4位数值转换为HEX字符。
- * 参数：
- * - v: 低4位有效
- * 返回：
- * - '0'~'9' 或 'A'~'F'
- */
-static char HexNibble(unsigned char v)
+void Display_Temp_On_LCD(int temp_x10)
 {
-    v &= 0x0F;
-    if (v < 10)
+    unsigned int abs_val;
+
+    if (temp_x10 < 0)
     {
-        return (char)('0' + v);
+        abs_val = (unsigned int)(-temp_x10);
+        LCD_ShowChar(2, 6, '-');
     }
-    return (char)('A' + (v - 10));
+    else
+    {
+        abs_val = (unsigned int)temp_x10;
+        LCD_ShowChar(2, 6, '+');
+    }
+
+    if (abs_val > 999) abs_val = 999;
+
+    LCD_ShowChar(2, 7, (char)('0' + (abs_val / 100 % 10)));
+    LCD_ShowChar(2, 8, (char)('0' + (abs_val / 10 % 10)));
+    LCD_ShowChar(2, 9, '.');
+    LCD_ShowChar(2, 10, (char)('0' + (abs_val % 10)));
+    LCD_ShowChar(2, 11, 'C');
 }
 
-/*
- * 函数：U8ToHex
- * 作用：将1字节转换为2位HEX文本。
- * 参数：
- * - v: 输入字节
- * - out2: 输出缓冲区，至少2字节
- * 返回：无
+/**
+ * @brief 构建并发送温度状态数据帧
+ * @param seq 帧序号
  */
-static void U8ToHex(unsigned char v, char *out2)
+void ActionCenter_SendTempFrame(unsigned char seq)
 {
-    out2[0] = HexNibble((unsigned char)(v >> 4));
-    out2[1] = HexNibble(v);
-}
+    unsigned char xdata payload[5];
+    int temp = ActionCenter_GetTempX10();
 
-/*
- * 函数：LcdClear
- * 作用：清空LCD1602两行16列字符。
- * 参数：无
- * 返回：无
- */
-static void LcdClear(void)
-{
-    unsigned char c;
-    for (c = 1; c <= 16; ++c)
-    {
-        LCD_ShowChar(1, c, ' ');
-        LCD_ShowChar(2, c, ' ');
-    }
-}
+    payload[0] = ActionCenter_GetMode();
+    payload[1] = (unsigned char)(temp & 0xFF);
+    payload[2] = (unsigned char)((temp >> 8) & 0xFF);
+    payload[3] = ActionCenter_GetPos();
+    payload[4] = ActionCenter_GetErr();
 
-/*
- * 函数：ShowNameById
- * 作用：根据协议层输出的name_id显示命令名称。
- * 参数：
- * - name_id: 命令名称ID（PROTO_V1_NAME_xxx）
- * 返回：无
- */
-static void ShowNameById(unsigned char name_id)
-{
-    if (name_id == PROTO_V1_NAME_PING_REQ) LCD_ShowString(1, 1, "PING_REQ");
-    else if (name_id == PROTO_V1_NAME_MODE_SET) LCD_ShowString(1, 1, "MODE_SET");
-    else if (name_id == PROTO_V1_NAME_MOVE_TO) LCD_ShowString(1, 1, "MOVE_TO");
-    else if (name_id == PROTO_V1_NAME_STOP_REQ) LCD_ShowString(1, 1, "STOP_REQ");
-    else if (name_id == PROTO_V1_NAME_BEEP_REQ) LCD_ShowString(1, 1, "BEEP_REQ");
-    else if (name_id == PROTO_V1_NAME_CFG_GET) LCD_ShowString(1, 1, "CFG_GET");
-    else if (name_id == PROTO_V1_NAME_CFG_SET) LCD_ShowString(1, 1, "CFG_SET");
-    else if (name_id == PROTO_V1_NAME_STAT_GET) LCD_ShowString(1, 1, "STAT_GET");
-    else if (name_id == PROTO_V1_NAME_PING_RSP) LCD_ShowString(1, 1, "PING_RSP");
-    else if (name_id == PROTO_V1_NAME_STAT_RSP) LCD_ShowString(1, 1, "STAT_RSP");
-    else if (name_id == PROTO_V1_NAME_CFG_RSP) LCD_ShowString(1, 1, "CFG_RSP");
-    else if (name_id == PROTO_V1_NAME_ACK) LCD_ShowString(1, 1, "ACK");
-    else if (name_id == PROTO_V1_NAME_NACK) LCD_ShowString(1, 1, "NACK");
-    else if (name_id == PROTO_V1_NAME_STAT_EVT) LCD_ShowString(1, 1, "STAT_EVT");
-    else if (name_id == PROTO_V1_NAME_ERR_EVT) LCD_ShowString(1, 1, "ERR_EVT");
-    else LCD_ShowString(1, 1, "UNKNOWN");
-}
-
-/*
- * 函数：ShowDecoded
- * 作用：将协议层输出的解码结果显示到LCD。
- * 参数：
- * - dec: 解码结果指针
- * 返回：无
- */
-static void ShowDecoded(const ProtoV1Decoded *dec)
-{
-    char hex2[3];
-
-    LcdClear();
-    ShowNameById(dec->name_id);
-
-    if (dec->valid == 0)
-    {
-        if (dec->err == PROTO_V1_ERR_CMD_UNKNOWN)
-        {
-            U8ToHex(dec->cmd, hex2);
-            hex2[2] = '\0';
-            LCD_ShowString(2, 1, "UNK CMD 0x");
-            LCD_ShowString(2, 10, hex2);
-        }
-        else
-        {
-            LCD_ShowString(2, 1, "ERR:LEN/RULE");
-        }
-        return;
-    }
-
-    /* 默认显示SEQ和LEN */
-    LCD_ShowString(2, 1, "S00 L00");
-    U8ToHex(dec->seq, hex2);
-    LCD_ShowChar(2, 2, hex2[0]);
-    LCD_ShowChar(2, 3, hex2[1]);
-    U8ToHex(dec->len, hex2);
-    LCD_ShowChar(2, 6, hex2[0]);
-    LCD_ShowChar(2, 7, hex2[1]);
-
-    /* 常用命令参数显示 */
-    if (dec->name_id == PROTO_V1_NAME_MOVE_TO && dec->len >= 1)
-    {
-        LCD_ShowString(2, 1, "P:000%");
-        LCD_ShowChar(2, 3, (char)('0' + (dec->p0 / 100)));
-        LCD_ShowChar(2, 4, (char)('0' + ((dec->p0 / 10) % 10)));
-        LCD_ShowChar(2, 5, (char)('0' + (dec->p0 % 10)));
-    }
-    else if (dec->name_id == PROTO_V1_NAME_MODE_SET && dec->len >= 1)
-    {
-        LCD_ShowString(2, 1, "MODE=0x00");
-        U8ToHex(dec->p0, hex2);
-        LCD_ShowChar(2, 8, hex2[0]);
-        LCD_ShowChar(2, 9, hex2[1]);
-    }
-    else if ((dec->name_id == PROTO_V1_NAME_ACK || dec->name_id == PROTO_V1_NAME_NACK) && dec->len >= 1)
-    {
-        LCD_ShowString(2, 1, "CODE=0x00");
-        U8ToHex(dec->p0, hex2);
-        LCD_ShowChar(2, 8, hex2[0]);
-        LCD_ShowChar(2, 9, hex2[1]);
-    }
+    Uart_ProtocolSendFrame(0x80, seq, payload, 5);
 }
 
 void main(void)
 {
+    unsigned int sample_timer_main = 0;
+
     LCD_Init();
     LCD_ShowString(1, 1, "PROTO MONITOR");
-    LCD_ShowString(2, 1, "WAIT FRAME...");
+    LCD_ShowString(2, 1, "TEMP:+00.0C");
 
     UartInit();
     ProtoV1_Init();
@@ -175,13 +78,41 @@ void main(void)
     while (1)
     {
         ProtoV1_Poll();
-        while (ProtoV1_GetDecoded(&g_dec))
+        DelayMS(10);                 /* 粗略 10ms 节拍 */
+        sample_timer_main++;
+        /* 每10ms调用一次温度状态机 */
+        ActionCenter_GetTempure();
+
+        /* LCD刷新：先按1秒一次，更贴合你当前温度采样节奏 */
+        if ((sample_timer_main % 100) == 0)
         {
-            ActionCenter_Execute(&g_dec);
-            ShowDecoded(&g_dec);
+            if (ActionCenter_IsTempValid())
+            {
+                Display_Temp_On_LCD(ActionCenter_GetTempX10());
+            }
+            else
+            {
+                LCD_ShowString(2, 1, "TEMP: ERROR    ");
+            }
         }
-        ProtoV1_Tick10ms();
-        ActionCenter_Tick10ms();
-        DelayMS(10);
+
+        /* 发帧：先按2秒一次 */
+        if ((sample_timer_main % 200) == 0)
+        {
+            if (ActionCenter_IsTempValid())
+            {
+                ActionCenter_SendTempFrame((unsigned char)(sample_timer_main / 200));
+            }
+        }
+        //  if(ProtoV1_GetDecoded(&g_dec))
+        // {
+        //     ActionCenter_Execute(&g_dec);
+        //     // ShowDecoded(&g_dec);
+        // }
+        /* 防止计数一直变大 */
+        if (sample_timer_main >= 60000)
+        {
+            sample_timer_main = 0;
+        }
     }
 }

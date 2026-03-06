@@ -32,12 +32,10 @@ void ActionCenter_Init(void);
  */
 void ActionCenter_Execute(const ProtoV1Decoded *dec);
 
-/*
- * 函数：ActionCenter_Tick10ms
- * 作用：10ms周期任务，推进模块内部时间相关逻辑。
- * 参数：无
- * 返回：无
- */
-void ActionCenter_Tick10ms(void);
-
+void ActionCenter_GetTempure(void);
+int ActionCenter_GetTempX10(void);
+unsigned char ActionCenter_IsTempValid(void) ;
+unsigned char ActionCenter_GetMode(void);
+unsigned char ActionCenter_GetPos(void);
+unsigned char ActionCenter_GetErr(void);
 #endif

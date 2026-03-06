@@ -1,7 +1,7 @@
 #include "action_center.h"
 #include "../bsp/bsp_uart.h"
 #include "../drivers/buzzer.h"
-
+#include "../drivers/ds18b20.h"
 /* 请求命令 */
 #define CMD_PING_REQ        0x01
 #define CMD_MODE_SET_REQ    0x02
@@ -249,13 +249,37 @@ void ActionCenter_Execute(const ProtoV1Decoded *dec)
     send_ack(dec->seq, 0, ACK_CODE_BAD_CMD);
 }
 
-void ActionCenter_Tick10ms(void)
+static int g_last_stable_temp = 0; // 缓存正确温度
+static unsigned char g_temp_valid = 0;
+static unsigned int idata sample_timer = 0;
+void ActionCenter_GetTempure(void)
 {
-    unsigned char i;
+    int16_t temp_raw;
 
-    ++g_uptime_10ms;
-    for (i = 0; i < 10; ++i)
-    {
-        Buzzer_Task1ms();
+    sample_timer++;
+
+    // 每 1 秒（100 * 10ms）执行一次完整的采样状态机
+    if (sample_timer == 1) {
+        // 第一步：触发转换
+        DS18B20_StartConvert();
     }
+    else if (sample_timer == 81) { 
+        // 第二步：800ms 后读取数据，此时传感器一定转换完了
+        if (DS18B20_ReadTempX10(&temp_raw) == DS18B20_OK) {
+            g_last_stable_temp = (int)temp_raw;
+            g_temp10 = (int)temp_raw;
+            g_temp_valid = 1;
+        } else {
+            g_temp_valid = 0;
+        }
+    }
+    
+    if (sample_timer >= 100) sample_timer = 0;
 }
+
+// 供 LCD 直接调用的接口：直接返回缓存的最新正确温度
+int ActionCenter_GetTempX10(void) { return g_last_stable_temp; }
+unsigned char ActionCenter_IsTempValid(void) { return g_temp_valid; }
+unsigned char ActionCenter_GetMode(void) { return g_mode; }
+unsigned char ActionCenter_GetPos(void)  { return g_pos; }
+unsigned char ActionCenter_GetErr(void)  { return g_err; }
